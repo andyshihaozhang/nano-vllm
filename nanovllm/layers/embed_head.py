@@ -5,7 +5,7 @@ import torch.distributed as dist
 
 from nanovllm.utils.context import get_context
 
-
+# embedding 将词token转化为hidden向量
 class VocabParallelEmbedding(nn.Module):
 
     def __init__(
@@ -41,7 +41,7 @@ class VocabParallelEmbedding(nn.Module):
             dist.all_reduce(y)
         return y
 
-
+# 将计算出的hidden向量转化为对应的token
 class ParallelLMHead(VocabParallelEmbedding):
 
     def __init__(

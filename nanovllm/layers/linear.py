@@ -1,3 +1,5 @@
+# TP并行
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -23,7 +25,7 @@ class LinearBase(nn.Module):
         self.tp_rank = dist.get_rank()
         self.tp_size = dist.get_world_size()
         self.weight = nn.Parameter(torch.empty(output_size, input_size))
-        self.weight.weight_loader = self.weight_loader
+        self.weight.weight_loader = self.weight_loader # 将weight_loader方法绑定到weght上，方便权重加载时获取
         if bias:
             self.bias = nn.Parameter(torch.empty(output_size))
             self.bias.weight_loader = self.weight_loader
@@ -68,7 +70,8 @@ class ColumnParallelLinear(LinearBase):
         start_idx = self.tp_rank * shard_size
         loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
         param_data.copy_(loaded_weight)
-
+        
+    # 完成升维 xW
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.linear(x, self.weight, self.bias)
 
@@ -148,7 +151,7 @@ class RowParallelLinear(LinearBase):
         start_idx = self.tp_rank * shard_size
         loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
         param_data.copy_(loaded_weight)
-
+    # 降维 + AllReduce
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
         if self.tp_size > 1:

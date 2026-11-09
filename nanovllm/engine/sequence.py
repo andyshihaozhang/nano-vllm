@@ -1,10 +1,12 @@
+# propmt为单位的token请求状态记录对象
+
 from copy import copy
 from enum import Enum, auto
 from itertools import count
 
 from nanovllm.sampling_params import SamplingParams
 
-
+#  序列状态枚举
 class SequenceStatus(Enum):
     WAITING = auto()
     RUNNING = auto()
@@ -20,12 +22,12 @@ class Sequence:
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
         self.last_token = token_ids[-1]
-        self.num_tokens = len(self.token_ids)
-        self.num_prompt_tokens = len(token_ids)
-        self.num_cached_tokens = 0
-        self.num_scheduled_tokens = 0
+        self.num_tokens = len(self.token_ids)               # 所有token数
+        self.num_prompt_tokens = len(token_ids)             # prompt对应的token数
+        self.num_cached_tokens = 0                          # 已处理的token数
+        self.num_scheduled_tokens = 0                       # 当前轮待处理的token数
         self.is_prefill = True
-        self.block_table = []
+        self.block_table = []                               # 已分配的KVCache块，记录的是 逻辑块号 -> 物理块号 的映射
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
@@ -51,33 +53,48 @@ class Sequence:
     @property
     def completion_token_ids(self):
         return self.token_ids[self.num_prompt_tokens:]
-
+    '''
+    预期需要的块数:
+        + self.block_size - 1 为了向上取整
+    '''
     @property
     def num_blocks(self):
         return (self.num_tokens + self.block_size - 1) // self.block_size
-
+    '''
+    最后一块的token数
+    '''
     @property
     def last_block_num_tokens(self):
         return self.num_tokens - (self.num_blocks - 1) * self.block_size
-
+    '''
+    获取指定的block
+    '''
     def block(self, i):
         assert 0 <= i < self.num_blocks
         return self.token_ids[i*self.block_size: (i+1)*self.block_size]
-
+    '''
+    维护token_ids列表
+    '''
     def append_token(self, token_id: int):
         self.token_ids.append(token_id)
         self.last_token = token_id
         self.num_tokens += 1
-
+    '''
+    pickle.dumps序列化共享给其他rank进程指定的属性
+    '''
     def __getstate__(self):
         last_state = self.last_token if not self.is_prefill else self.token_ids
         return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state)
-
+    '''
+    pickle.loads序列化加载进程共享的属性
+    '''
     def __setstate__(self, state):
         self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state = state
         if isinstance(last_state, list):
+            # Prefill
             self.token_ids = last_state
             self.last_token = self.token_ids[-1]
         else:
+            # Decode
             self.token_ids = []
             self.last_token = last_state

@@ -1,3 +1,5 @@
+# 加载并运行模型，完成每个请求的运算。当TP > 1时，主进程会启动多个Model Runner实例，共同完成前向计算。
+
 import pickle
 import torch
 import torch.distributed as dist
@@ -15,29 +17,44 @@ from nanovllm.utils.loader import load_model
 class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+        # 保存配置和进程信息
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
-        self.enforce_eager = config.enforce_eager
-        self.world_size = config.tensor_parallel_size
-        self.rank = rank
-        self.event = event
+        self.enforce_eager = config.enforce_eager # 是否强制普通执行，关闭 CUDA Graph 路径
+        self.world_size = config.tensor_parallel_size # 参与张量并行的进程数量
+        self.rank = rank # GPU编号
+        self.event = event # 多进程用于通知执行任务的同步对象
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
-        torch.cuda.set_device(rank)
+        # -------- 切换GPU环境进行初始化 ---------
+        # 初始化GPU通信并选择设备
+        dist.init_process_group(
+            "nccl", # 面向 NVIDIA GPU 的集合通信库，支持后续张量并行中的数据汇总等操作
+            "tcp://localhost:2333", 
+            world_size=self.world_size, 
+            rank=rank
+        )
+        torch.cuda.set_device(rank) # 让当前进程使用对应的 GPU
+        # 初始化张量默认精度以及设备
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
+        # 初始化模型、模型权重、采样器
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
+        # 模型预热
         self.warmup_model()
+        # 分配KV缓存
         self.allocate_kv_cache()
+        # 初始化CUDA Graph
         if not self.enforce_eager:
             self.capture_cudagraph()
+        
+        # -------- 返回CPU环境 --------
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
-
+        # 多卡环境进程间通信初始化
         if self.world_size > 1:
             if rank == 0:
                 self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
@@ -46,7 +63,9 @@ class ModelRunner:
                 dist.barrier()
                 self.shm = SharedMemory(name="nanovllm")
                 self.loop()
-
+    '''
+    进程退出资源清理
+    '''
     def exit(self):
         if self.world_size > 1:
             self.shm.close()
@@ -57,14 +76,19 @@ class ModelRunner:
             del self.graphs, self.graph_pool
         torch.cuda.synchronize()
         dist.destroy_process_group()
-
+    '''
+    进程循环等待调用:
+        用于 TP > 1 时其他rank进程进行计算
+    '''
     def loop(self):
         while True:
             method_name, args = self.read_shm()
             self.call(method_name, *args)
             if method_name == "exit":
                 break
-
+    '''
+    通过共享内存获取事件和信息
+    '''
     def read_shm(self):
         assert self.world_size > 1 and self.rank > 0
         self.event.wait()
@@ -72,7 +96,9 @@ class ModelRunner:
         method_name, *args = pickle.loads(self.shm.buf[4:n+4])
         self.event.clear()
         return method_name, args
-
+    '''
+    通过共享内存发送事件和信息
+    '''
     def write_shm(self, method_name, *args):
         assert self.world_size > 1 and self.rank == 0
         data = pickle.dumps([method_name, *args])
@@ -81,16 +107,24 @@ class ModelRunner:
         self.shm.buf[4:n+4] = data
         for event in self.event:
             event.set()
-
+    '''
+    反射，调用制定方法
+    '''
     def call(self, method_name, *args):
         if self.world_size > 1 and self.rank == 0:
             self.write_shm(method_name, *args)
         method = getattr(self, method_name, None)
         return method(*args)
-
+    '''
+    模型预热: 
+        1.由于模型运行时除了权重还会产生中间结果和临时工作空间，所有需要测量推理的显存峰值，为后续 KV Cache 分配留出空间；
+        2.提前触发部分首次执行开销。
+    '''
     def warmup_model(self):
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
+        # 运行前重置
+        torch.cuda.empty_cache() # 释放 PyTorch 缓存分配器中暂时不用的显存，已有模型权重仍然保留
+        torch.cuda.reset_peak_memory_stats() # 将峰值统计重置到当前使用量，接下来就可以观察这次前向计算造成的峰值
+        # 虚拟构造最大批次请求
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
         seq_len = min(max_num_batched_tokens, max_model_len)
         num_seqs = min(max_num_batched_tokens // seq_len, self.config.max_num_seqs)
@@ -99,7 +133,9 @@ class ModelRunner:
             seq.num_scheduled_tokens = seq_len
         self.run(seqs, True)
         torch.cuda.empty_cache()
-
+    '''
+    估算容量，分配 GPU 上的 KV Cache
+    '''
     def allocate_kv_cache(self):
         config = self.config
         hf_config = config.hf_config
@@ -125,15 +161,17 @@ class ModelRunner:
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
-
+    '''
+    prefill张量化
+    '''
     def prepare_prefill(self, seqs: list[Sequence]):
         input_ids = []
         positions = []
-        cu_seqlens_q = [0]
-        cu_seqlens_k = [0]
+        cu_seqlens_q = [0] # 变长seq的q边界数组
+        cu_seqlens_k = [0] # 变长seq的k边界数组
         max_seqlen_q = 0
         max_seqlen_k = 0
-        slot_mapping = []
+        slot_mapping = [] # 每个token在KV Cache中的物理位置
         block_tables = None
         for seq in seqs:
             start = seq.num_cached_tokens
@@ -168,7 +206,9 @@ class ModelRunner:
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         return input_ids, positions
-
+    '''
+    decode张量化
+    '''
     def prepare_decode(self, seqs: list[Sequence]):
         input_ids = []
         positions = []
@@ -186,7 +226,7 @@ class ModelRunner:
         block_tables = self.prepare_block_tables(seqs)
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
-
+    # python采样参数格式 -> cuda采样参数格式
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = [seq.temperature for seq in seqs]
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
@@ -212,8 +252,10 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        # 张量生成
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        # GPU计算
         logits = self.run_model(input_ids, positions, is_prefill)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()

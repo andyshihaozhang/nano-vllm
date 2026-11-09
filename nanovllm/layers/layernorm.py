@@ -1,3 +1,5 @@
+# 归一化RMSNorm
+
 import torch
 from torch import nn
 

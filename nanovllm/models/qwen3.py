@@ -10,7 +10,7 @@ from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
-
+# 注意力模块
 class Qwen3Attention(nn.Module):
 
     def __init__(
@@ -37,7 +37,7 @@ class Qwen3Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
-        self.qkv_bias = qkv_bias
+        self.qkv_bias = qkv_bias    # QK归一化开关
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -87,7 +87,7 @@ class Qwen3Attention(nn.Module):
         output = self.o_proj(o.flatten(1, -1))
         return output
 
-
+# 前馈网络MLP模块
 class Qwen3MLP(nn.Module):
 
     def __init__(
@@ -116,7 +116,7 @@ class Qwen3MLP(nn.Module):
         x = self.down_proj(x)
         return x
 
-
+# Decode-Only形式的Transformer（归一化Norm + 注意力Attention + 残差连接ResNet + 归一化Norm + MLP + 残差连接ResNet）
 class Qwen3DecoderLayer(nn.Module):
 
     def __init__(
@@ -158,7 +158,7 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
-
+# QWen模型层（词嵌入Embedding + N层Transformer + 最终归一化Norm）
 class Qwen3Model(nn.Module):
 
     def __init__(
@@ -182,7 +182,11 @@ class Qwen3Model(nn.Module):
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
-
+'''
+模型抽象层
+- nn: PyTorch神经网络工具包-neural network
+- nn.Module: 神经网络基类
+'''
 class Qwen3ForCausalLM(nn.Module):
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),

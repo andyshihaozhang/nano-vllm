@@ -1,3 +1,5 @@
+# 算子层全局参数上下文
+
 from dataclasses import dataclass
 import torch
 
